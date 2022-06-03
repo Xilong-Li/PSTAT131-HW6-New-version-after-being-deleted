@@ -1,0 +1,296 @@
+---
+title: "HW6 Xilong Li new version after deleted"
+author: "Xilong Li (3467966)"
+date: '2022-06-02'
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,message=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(MASS)
+library(glmnet)
+library(janitor) 
+library(discrim)
+library(poissonreg)
+library(klaR)
+library(rpart.plot)
+library(vip)
+library(randomForest)
+library(xgboost)
+```
+Note of citation: all of the codes and the use of codes in this HW are cited from labs and previous homework :-)
+
+## Question 1:
+```{r}
+pokemon_original <- read.csv("Pokemon.csv")
+pokemon <- janitor:: clean_names(dat = pokemon_original)
+head(pokemon)
+
+filtered_pokemon <- pokemon %>% 
+  filter(type_1 %in% c("Bug", "Fire", "Grass", "Normal", "Water", "Psychic"))
+final_pokemon <- filtered_pokemon %>% 
+  mutate(type_1 = factor(type_1),
+         legendary = factor(legendary))
+dim(final_pokemon)
+class(final_pokemon$type_1)
+class(final_pokemon$legendary)
+```
+```{r}
+set.seed(2216)
+
+poke_split <- initial_split(final_pokemon, prop = 0.80,
+                            strata = type_1)
+
+poke_train <- training(poke_split)
+poke_test <- testing(poke_split)
+
+poke_folds <- vfold_cv(poke_train, v = 5, strata = type_1)
+class(poke_folds)
+```
+```{r}
+poke_recipe <- recipe(type_1 ~ 
+                        legendary + 
+                        generation + 
+                        sp_atk + 
+                        attack + 
+                        speed + 
+                        defense + 
+                        hp + 
+                        sp_def,
+                       data = poke_train) %>% 
+  step_dummy(legendary,generation) %>% 
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+poke_recipe
+```
+
+## Question 2:
+```{r}
+library(corrplot)
+head(poke_train)
+
+cor_data <- poke_train %>% 
+  dplyr::select(-x) %>% 
+  dplyr::select(where(is.numeric)) 
+corrplot(cor(cor_data), type = 'lower',diag = FALSE)
+
+```
+    
+As it can be seen above, all attribute factors show positive correlation to each other, except for the attribute of "generation".         
+In particular, the attribute "total" shows strong positive correlation to other factors.        
+This makes sense to me since "total" measures the overall score of this pokemon, and thus the higher the scores of other factors, the higher the score of "total".
+
+## Question 3:
+```{r}
+poke_spec <- decision_tree() %>%
+  set_engine("rpart")
+
+class_poke_spec <- poke_spec %>%
+  set_mode("classification") %>% 
+  set_args(cost_complexity = tune())
+
+class_poke_wf <- workflow() %>%
+  add_model(class_poke_spec) %>%
+  add_recipe(poke_recipe)
+
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+```
+```{r, cache = TRUE}
+tree_tune <- tune_grid(
+  class_poke_wf, 
+  resamples = poke_folds, 
+  grid = param_grid, 
+  metrics = metric_set(roc_auc)
+)
+```
+
+```{r}
+autoplot(tree_tune)
+```
+    
+As it is shown in the graph above, it might be better to have smaller complexity penalty, because as the complexity penalty increases to a very large level, the roc_auc decreases quickly.        
+
+## Question 4:
+```{r}
+best_tree_roc_auc <- collect_metrics(tree_tune) %>% 
+  arrange(-mean) %>% 
+  head(1)
+best_tree_roc_auc
+
+```
+    
+As it can be shown the fold with 0.007742637 cost_complexity level has the highest roc_auc mean, which is 0.6411691.         
+
+## Question 5:
+```{r}
+
+best_complexity <- select_best(tree_tune)
+
+class_poke_final <- finalize_workflow(class_poke_wf, best_complexity)
+
+class_poke_final_fit <- fit(class_poke_final, data = poke_train)
+
+class_poke_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+```
+    
+```{r}
+# ?rand_forest
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>% 
+  add_recipe(poke_recipe) %>% 
+  add_model(rf_spec)
+
+rf_grid <- grid_regular(mtry(range = c(3,8)), trees(range = c(5,500)), 
+                        min_n(range = c(3,8)), levels = 5)
+```
+    
+a) mtry: means the number of randomly selected predictors;        
+b) trees: means the number of trees that will be in this model;       
+c) min_n: means the minimal node size, which is the minimum number of data points in a node;       
+    
+Since "mtry" means the randomly selected predictors, and also because there are only 8 predictors in our model, the "mtry" can only be from 1 to 8;        
+If "mtry" = 8, which is the maximum number of predictors in our model, then the model will become a bagging forest.
+
+## Question 6:
+```{r, cache = TRUE}
+library(ranger)
+
+rf_tune <- tune_grid(
+  rf_wf, 
+  resamples = poke_folds, 
+  grid = rf_grid, 
+  metrics = metric_set(roc_auc)
+)
+```
+```{r}
+
+autoplot(rf_tune)
+
+```
+    
+As the graph above has shown, it seems that when the number of trees is higher than 128 (chosed in the graph), the roc_auc is significantly higher than the case that has only 5 trees. However, when the number of trees gets even higher, it does not seem to make too many differences;        
+Also, it seems that the number of nodes does not have strong influence on the result;
+Furthermore, it is shown on the graph that has the number of randomly selected predictors increases, the roc_auc actually tends to decreases.
+
+## Question 7:
+```{r}
+best_random_roc_auc <- collect_metrics(rf_tune) %>% 
+  arrange(-mean) %>%
+  head(1)
+best_random_roc_auc
+```
+    
+Thus, as it is shown above, the best roc_auc in this random forest model is 0.7420186;        
+
+## Question 8:
+```{r}
+best_model <- select_best(rf_tune, metric = "roc_auc")
+final_rf <- finalize_workflow(rf_wf, best_model)
+final_fit <- fit(final_rf, data = poke_train)
+
+final_fit %>% 
+  extract_fit_engine() %>% 
+  vip()
+```
+    
+As it is shown in the graph above, "sp_atk" has the greatest importance as predictor in this model;       
+On the opposite, "legendary_True" is hast the least importance, which might be reasonably explained because the number of legendary pokemon is too small so that this predictor does not affect much to the overall model.
+
+## Question 9:
+```{r}
+boost_spec <- boost_tree(trees = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf <- workflow() %>% 
+  add_model(boost_spec) %>% 
+  add_recipe(poke_recipe) 
+
+boost_grid <- grid_regular(trees(range = c(10,2000)), levels = 10)
+
+```
+```{r, cache = TRUE}
+boost_tune <- tune_grid(
+  boost_wf, 
+  resamples = poke_folds,
+  grid = boost_grid,
+  metrics = metric_set(roc_auc)
+)
+
+```
+
+```{r}
+autoplot(boost_tune)
+```
+```{r}
+best_boost_roc_auc <- collect_metrics(boost_tune) %>% 
+  arrange(-mean) %>% 
+  head(1)
+best_boost_roc_auc
+```
+    
+As it can be seen in the graph and data above: The roc_auc of my best performing model is 0.7148797, when trees = 231;
+
+## Question 10:
+```{r}
+models_roc_auc_mean<- c(best_tree_roc_auc$mean, 
+                    best_random_roc_auc$mean, 
+                    best_boost_roc_auc$mean)
+names <- c("pruned tree", "random forest", "boosted tree")
+
+compare <- tibble(models_roc_auc_mean,names) %>% 
+  arrange(-models_roc_auc_mean)
+
+compare
+```
+    
+As it is shown, the random forest model has the highest roc_auc and thus has the best performance. And thus we use the random forest model then.
+
+```{r}
+best_model <- select_best(rf_tune)
+
+rf_final <- finalize_workflow(rf_wf, best_model)
+
+rf_final_fit <- fit(rf_final, data = poke_train)
+
+augmented_result <- augment(rf_final_fit, new_data = poke_test)
+
+augment(rf_final_fit, new_data = poke_test) %>%
+  accuracy(truth = type_1, estimate = .pred_class)
+```
+```{r}
+predicted_result <- augmented_result[c('type_1',
+                                       '.pred_class', 
+                                       '.pred_Bug',
+                                       '.pred_Fire', 
+                                       '.pred_Grass', 
+                                       '.pred_Normal',
+                                       '.pred_Psychic',
+                                       '.pred_Water')]
+head(predicted_result)
+```
+```{r}
+roc_auc(predicted_result, type_1, c(.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Psychic, .pred_Water))
+
+roc_curve(predicted_result, type_1, c(.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Psychic,.pred_Water)) %>% autoplot()
+
+predicted_result %>% 
+  conf_mat(type_1, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+    
+As it is shown above, Bug, Normal, and Water are predicted most accurately, while Grass is worst predicted.
